@@ -1,0 +1,11 @@
+{
+  "root_llm": {
+    "model": "openrouter/google/gemini-3-flash-preview"
+  },
+  "sub_llm": {
+    "model": "openrouter/google/gemini-3-flash-preview"
+  },
+  "memory_compaction": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,18 @@
+[project]
+name = "rlm-from-scratch"
+version = "0.1.0"
+description = "RLM paper implementation - LLM with persistent REPL environment"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.40.0",
+    "click>=8.1.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+rlm = "rlm.cli.cli:main"
+
+[tool.uv]
+package = false

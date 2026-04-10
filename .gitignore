@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# RLM runtime state
+.rlm_state
+
+# Data files (user-provided, not committed)
+data/
+
+# Private docs
+strategy.md
+
+# IDE
+.cursor/
+.claude
