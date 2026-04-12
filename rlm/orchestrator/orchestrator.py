@@ -81,8 +81,9 @@ class Orchestrator:
             return []
 
         paths = []
-        potential_paths = re.findall(r'["\'](/[^"\']+)["\']', code)
-        for p in potential_paths:
+        potential_paths = re.findall(r'["\'](([A-Za-z]:\\[^"\']+)|(/[^"\']+))["\']', code)
+        for match in potential_paths:
+            p = match[0]
             if len(p) > 2:
                 paths.append(Path(p))
         return paths
