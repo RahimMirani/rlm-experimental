@@ -1,0 +1,105 @@
+RLM stress test corpus (single file). Answer every TASK at the end using only this document. Use FINAL() for the complete answer bundle.
+
+================================================================================
+SECTION 0 — FILLER / DISTRACTORS
+================================================================================
+The Northridge inventory sync runs every Tuesday. SKU-8841 was retired in Q3.
+Weather dashboards are unrelated to this document. Lorem batch 1: alpha, beta.
+
+================================================================================
+SECTION 1 — TRANSACTION LOG (for counting TASK B)
+================================================================================
+2025-01-03 09:01 |INFO| batch start id=77
+2025-01-03 09:02 |ERR| timeout contacting edge node e7
+2025-01-03 09:04 |INFO| retry ok
+2025-01-03 09:10 |WARN| latency p95 high
+2025-01-03 09:11 |ERR| stale cache key k9
+2025-01-03 09:12 |INFO| warmup complete
+2025-01-03 09:15 |ERROR| wrong number (this is NOT the marker — note spelling)
+2025-01-03 09:16 |ERR|
+2025-01-03 09:17 |INFO| idle
+2025-01-03 09:20 |WARN| synthetic |ERR| mention in prose only
+2025-01-03 09:21 |INFO | malformed spacing line should be ignored for pipe marker
+2025-01-03 09:22 |ERR| final checkpoint fail
+
+RULE FOR TASK B: Count only lines where the log field is exactly the three-character marker surrounded by pipes: |ERR| (pipe, E-R-R, pipe). Do not count |ERROR|, partial matches inside prose, or lines where the pipes are missing or broken.
+
+================================================================================
+SECTION 2 — EMPLOYEE FACTS (multi-hop TASK C)
+================================================================================
+Employee roster (excerpt):
+- E-104, title Senior Analyst, desk 12B
+- E-205, title Junior Analyst, desk 4C
+Policy note: titles alone do not imply department; use the Manager Directory.
+
+================================================================================
+SECTION 3 — REPORTING (multi-hop TASK C)
+================================================================================
+Reporting matrix Q4:
+E-104 reports_to M-22
+E-205 reports_to M-18
+
+================================================================================
+SECTION 4 — MANAGER DIRECTORY (multi-hop TASK C)
+================================================================================
+M-22 — Dr. Lena Ortiz — department: Logistics — email lena.ortiz@example.invalid
+M-18 — Sam Okonkwo — department: Finance — email s.ok@example.invalid
+
+================================================================================
+SECTION 5 — HAYSTACK (needle TASK A)
+================================================================================
+Paragraph A: Procurement guidelines were last revised in 2021. Orange crates stack to seven high.
+
+Paragraph B: Vendor code VX-12 requires dual sign-off. Teal paint is deprecated for exterior use.
+
+Paragraph C: The cafeteria menu rotates weekly. Stapler audits are quarterly and boring.
+
+Paragraph D: Warehouse 3 uses FIFO for perishables. Pallet RFID tags must face outward.
+
+Paragraph E: Return merchandise authorization hours are 10:00–14:00 local. Do not scan bent barcodes.
+
+NEEDLE (AUTHORITATIVE FOR TASK A): PROJECT ZEPHYR BUDGET AUTH — subline 7-Q — approval token QUARTZ-OMEGA-184736 — END NEEDLE
+
+Paragraph F: Elevator 2 has a weight sensor fault ticket open. Hydration stations were refilled Monday.
+
+Paragraph G: Forklift certification expires after 24 months. Night shift prefers decaf.
+
+Paragraph H: If you see smoke near the compressor room, pull alarm A-2 first, then call ext. 4401.
+
+================================================================================
+SECTION 6 — MINI “REPO” SNIPPETS (coding TASK D)
+================================================================================
+--- file: config/routes.yaml (commented excerpt) ---
+# public API surface
+routes:
+  - path: "/api/v1/users/{user_id}"
+    methods: ["GET"]
+    handler: "handlers.users.get_user"
+  - path: "/api/v1/users/{user_id}/sessions"
+    methods: ["GET", "POST"]
+    handler: "handlers.users.sessions"
+
+--- file: docs/api_changelog.md (excerpt) ---
+## 2025-04 rollout
+- User fetch is now advertised under **GET /api/v2/users/{id}** for external partners.
+  Legacy v1 path remains supported during migration.
+
+--- file: handlers/users.py (excerpt) ---
+def get_user(user_id: str):
+    """Resolve user by id; bound to v1 route table only."""
+    return lookup_user(user_id)
+
+QUESTION FOR TASK D: Assume routing is implemented exactly as in routes.yaml (only those paths are registered). For an HTTP GET request to exactly `/api/v2/users/5` with no rewrite middleware: will the request be handled by `handlers.users.get_user`? Answer strictly YES or NO, then one sentence citing which file supports your conclusion.
+
+================================================================================
+TASKS (answer all; use only this document)
+================================================================================
+TASK A — Needle: What is the full **approval token** named in the NEEDLE line in SECTION 5 (include the exact token string as printed)?
+
+TASK B — Aggregation: Using SECTION 1 rules, how many **lines** contain the exact marker |ERR|?
+
+TASK C — Multi-hop: Employee E-104 is a Senior Analyst. Following the reporting matrix and manager directory, what **department** does E-104 roll up into?
+
+TASK D — Code / config consistency: Answer the YES/NO question in SECTION 6, with the required one-sentence justification.
+
+When responding as the system user test harness, provide all four answers clearly labeled TASK A–D.

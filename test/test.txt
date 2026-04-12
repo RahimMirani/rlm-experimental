@@ -1,8 +1,0 @@
-RLM smoke test file.
-
-Facts:
-- Apples are red.
-- Bananas are yellow.
-- Grapes can be green or purple.
-
-The purpose of this file is to verify that the REPL, Docker sandbox, and model call all work end to end.
