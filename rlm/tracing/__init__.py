@@ -1,0 +1,36 @@
+from rlm.tracing.schema import (
+    ContextWindowMetrics,
+    MemoryCompactionCallEvent,
+    ReplExecEvent,
+    RootLLMCallEvent,
+    RunMetadata,
+    RunOutcome,
+    RunTotals,
+    RunTrace,
+    StateSnapshotEvent,
+    SubLLMCallEvent,
+    UsageMetrics,
+    create_run_trace,
+    new_run_id,
+    utc_now,
+)
+from rlm.tracing.writer import DEFAULT_TRACE_DIR, JSONLTraceWriter
+
+__all__ = [
+    "ContextWindowMetrics",
+    "DEFAULT_TRACE_DIR",
+    "JSONLTraceWriter",
+    "MemoryCompactionCallEvent",
+    "ReplExecEvent",
+    "RootLLMCallEvent",
+    "RunMetadata",
+    "RunOutcome",
+    "RunTotals",
+    "RunTrace",
+    "StateSnapshotEvent",
+    "SubLLMCallEvent",
+    "UsageMetrics",
+    "create_run_trace",
+    "new_run_id",
+    "utc_now",
+]
