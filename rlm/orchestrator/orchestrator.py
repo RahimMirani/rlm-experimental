@@ -1,10 +1,21 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
 import litellm
 from rlm.orchestrator.tools import docker_runner
 from rlm.orchestrator.memory_compaction import MemoryCompactor
+from rlm.tracing import (
+    ContextWindowMetrics,
+    JSONLTraceWriter,
+    ReplExecEvent,
+    RootLLMCallEvent,
+    RunOutcome,
+    UsageMetrics,
+    create_run_trace,
+    utc_now,
+)
 from rlm.utils import console
 import re
 logger = logging.getLogger(__name__)
@@ -16,6 +27,48 @@ def load_system_prompt() -> str:
     return "You are an RLM (Reasoning Language Model) that analyzes large files through a Python REPL."
 
 FINAL_ANSWER_FILENAME = "__rlm_final__.txt"
+
+
+def _message_content_chars(messages: list[dict]) -> int:
+    return sum(len(str(message.get("content", ""))) for message in messages)
+
+
+def _extract_usage_metrics(response) -> UsageMetrics:
+    usage = getattr(response, "usage", None)
+    if usage is None and hasattr(response, "model_dump"):
+        usage = response.model_dump().get("usage")
+    if usage is None:
+        return UsageMetrics()
+
+    if hasattr(usage, "prompt_tokens"):
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+    else:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+
+    return UsageMetrics(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _safe_completion_cost(response) -> float | None:
+    try:
+        cost = litellm.completion_cost(completion_response=response)
+    except Exception:
+        return None
+    return float(cost) if cost is not None else None
+
+
+def _update_root_totals(trace, usage: UsageMetrics, cost_usd: float | None) -> None:
+    trace.totals.root_prompt_tokens += usage.prompt_tokens or 0
+    trace.totals.root_completion_tokens += usage.completion_tokens or 0
+    trace.totals.root_total_tokens += usage.total_tokens or 0
+    trace.totals.total_cost_usd += cost_usd or 0.0
 
 REPL_TOOL = {
     "type": "function",
@@ -69,6 +122,7 @@ class Orchestrator:
         self.messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
         self.compactor = MemoryCompactor(config)
         self.compact_enabled = config["memory_compaction"]["enabled"]
+        self.trace_writer = JSONLTraceWriter()
 
         logger.info(
             f"Orchestrator initialized: root_model={self.root_model}, "
@@ -99,114 +153,207 @@ class Orchestrator:
         return extra_env
 
     def run(self, user_query: str):
+        trace = create_run_trace(
+            query=user_query,
+            root_model=self.root_model,
+            sub_model=self.sub_model,
+        )
+        run_started_perf = time.perf_counter()
         interaction_start_idx = len(self.messages)
+        final_answer_path = None
+        final_answer = None
 
         self.messages.append({"role": "user", "content": user_query})
 
-        while True:
-            completion_kwargs = {
-                "model": self.root_model,
-                "messages": self.messages,
-                "tools": [REPL_TOOL],
-            }
+        try:
+            while True:
+                call_index = len(trace.root_calls) + 1
+                root_started_at = utc_now()
+                root_started_perf = time.perf_counter()
+                completion_kwargs = {
+                    "model": self.root_model,
+                    "messages": self.messages,
+                    "tools": [REPL_TOOL],
+                }
 
-            with console.get_status_spinner("Thinking...") as status:
-                response = litellm.completion(**completion_kwargs)
+                with console.get_status_spinner("Thinking...") as status:
+                    response = litellm.completion(**completion_kwargs)
 
-            assistant_message = response.choices[0].message
+                root_ended_at = utc_now()
+                usage = _extract_usage_metrics(response)
+                cost_usd = _safe_completion_cost(response)
+                assistant_message = response.choices[0].message
+                root_event = RootLLMCallEvent(
+                    call_index=call_index,
+                    started_at=root_started_at,
+                    ended_at=root_ended_at,
+                    latency_ms=(time.perf_counter() - root_started_perf) * 1000,
+                    model=self.root_model,
+                    usage=usage,
+                    context=ContextWindowMetrics(
+                        prompt_chars=_message_content_chars(self.messages),
+                        prompt_messages=len(self.messages),
+                    ),
+                    cost_usd=cost_usd,
+                    message_count=len(self.messages),
+                    tool_call_count=len(assistant_message.tool_calls or []),
+                    assistant_content_chars=len(assistant_message.content or ""),
+                    finish_reason=getattr(response.choices[0], "finish_reason", None),
+                )
+                trace.root_calls.append(root_event)
+                _update_root_totals(trace, usage, cost_usd)
 
-            msg_dict = assistant_message.model_dump()
-            if msg_dict.get("content") is None:
-                msg_dict["content"] = ""
-            self.messages.append(msg_dict)
+                msg_dict = assistant_message.model_dump()
+                if msg_dict.get("content") is None:
+                    msg_dict["content"] = ""
+                self.messages.append(msg_dict)
 
-            if not assistant_message.tool_calls:
-                console.print_assistant_answer(assistant_message.content)
+                if not assistant_message.tool_calls:
+                    console.print_assistant_answer(assistant_message.content)
+                    final_answer = assistant_message.content
+                    final_answer_path = "assistant_direct"
 
-                if self.compact_enabled:
-                    with console.get_status_spinner("Memory summarization...") as status:
-                        messages_to_summarize = self.messages[interaction_start_idx:]
-                        summary = self.compactor.summarize(messages_to_summarize)
+                    if self.compact_enabled:
+                        with console.get_status_spinner("Memory summarization...") as status:
+                            messages_to_summarize = self.messages[interaction_start_idx:]
+                            summary = self.compactor.summarize(messages_to_summarize)
 
-                        self.messages = self.messages[:interaction_start_idx] + [
-                            {"role": "system", "content": f"Previous interaction summary: {summary}"}
-                        ]
+                            self.messages = self.messages[:interaction_start_idx] + [
+                                {"role": "system", "content": f"Previous interaction summary: {summary}"}
+                            ]
 
-                return assistant_message.content
+                    return final_answer
 
-            final_answer = None
-            for tool_call in assistant_message.tool_calls:
-                if tool_call.function.name == "run_repl":
-                    try:
-                        args = json.loads(tool_call.function.arguments)
-                        python_code = args["python_code"]
+                for tool_call in assistant_message.tool_calls:
+                    if tool_call.function.name == "run_repl":
+                        repl_started_at = utc_now()
+                        repl_started_perf = time.perf_counter()
+                        python_code = ""
+                        current_mounts = []
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                            python_code = args["python_code"]
 
-                        console.print_tool_call(python_code)
+                            console.print_tool_call(python_code)
 
-                        current_mounts = self._extract_file_paths(python_code)
-                        extra_env = self._get_extra_env_for_repl()
+                            current_mounts = self._extract_file_paths(python_code)
+                            extra_env = self._get_extra_env_for_repl()
 
-                        with console.get_status_spinner("Executing REPL...") as status:
-                            stdout, stderr, exit_code = docker_runner.run_exec(
-                                code=python_code,
-                                state_dir=self.workspace,
-                                env_file=self.env_file,
-                                extra_env=extra_env,
-                                mount_paths=current_mounts
+                            with console.get_status_spinner("Executing REPL...") as status:
+                                stdout, stderr, exit_code = docker_runner.run_exec(
+                                    code=python_code,
+                                    state_dir=self.workspace,
+                                    env_file=self.env_file,
+                                    extra_env=extra_env,
+                                    mount_paths=current_mounts
+                                )
+
+                            result = stdout
+                            if stderr:
+                                result += f"\n[stderr]: {stderr}"
+                            if exit_code != 0:
+                                result += f"\n[exit_code]: {exit_code}"
+
+                            console.print_tool_result(result)
+
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": result
+                            })
+
+                            final_path = self.workspace / FINAL_ANSWER_FILENAME
+                            repl_event = ReplExecEvent(
+                                exec_index=len(trace.repl_execs) + 1,
+                                started_at=repl_started_at,
+                                ended_at=utc_now(),
+                                latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
+                                python_code_chars=len(python_code),
+                                mounted_paths=[str(path) for path in current_mounts],
+                                exit_code=exit_code,
+                                stdout_chars=len(stdout),
+                                stderr_chars=len(stderr),
+                                final_answer_emitted=final_path.exists(),
+                                tool_call_id=tool_call.id,
                             )
+                            trace.repl_execs.append(repl_event)
 
-                        result = stdout
-                        if stderr:
-                            result += f"\n[stderr]: {stderr}"
-                        if exit_code != 0:
-                            result += f"\n[exit_code]: {exit_code}"
+                            if final_path.exists():
+                                final_answer = final_path.read_text(encoding="utf-8")
+                                final_path.unlink()
+                                final_answer_path = "repl_final"
+                                console.print_final_answer(final_answer)
+                                break
 
-                        console.print_tool_result(result)
-
+                        except Exception as e:
+                            error_msg = f"Error executing tool: {str(e)}"
+                            console.print_tool_result(error_msg)
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": error_msg
+                            })
+                            trace.repl_execs.append(
+                                ReplExecEvent(
+                                    exec_index=len(trace.repl_execs) + 1,
+                                    started_at=repl_started_at,
+                                    ended_at=utc_now(),
+                                    latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
+                                    python_code_chars=len(python_code),
+                                    mounted_paths=[str(path) for path in current_mounts],
+                                    exit_code=None,
+                                    stdout_chars=0,
+                                    stderr_chars=len(error_msg),
+                                    final_answer_emitted=False,
+                                    tool_call_id=tool_call.id,
+                                )
+                            )
+                    else:
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": result
+                            "content": f"Unknown tool: {tool_call.function.name}"
                         })
 
-                        final_path = self.workspace / FINAL_ANSWER_FILENAME
-                        if final_path.exists():
-                            final_answer = final_path.read_text(encoding="utf-8")
-                            final_path.unlink()
-                            console.print_final_answer(final_answer)
-                            break
+                if final_answer is not None:
+                    truncated_ans = final_answer[:2000] + "..." if len(final_answer) > 2000 else final_answer
+                    note = f"\n\nThe final answer was delivered directly from the REPL. First 2000 chars: {truncated_ans}"
 
-                    except Exception as e:
-                        error_msg = f"Error executing tool: {str(e)}"
-                        console.print_tool_result(error_msg)
+                    if self.compact_enabled:
+                        with console.get_status_spinner("Memory summarization...") as status:
+                            messages_to_summarize = self.messages[interaction_start_idx:]
+                            summary = self.compactor.summarize(messages_to_summarize)
+
+                            self.messages = self.messages[:interaction_start_idx] + [
+                                {"role": "system", "content": f"Previous interaction summary: {summary}{note}"}
+                            ]
+                    else:
                         self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": error_msg
+                            "role": "system",
+                            "content": f"Interaction complete. {note}"
                         })
-                else:
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": f"Unknown tool: {tool_call.function.name}"
-                    })
 
-            if final_answer is not None:
-                truncated_ans = final_answer[:2000] + "..." if len(final_answer) > 2000 else final_answer
-                note = f"\n\nThe final answer was delivered directly from the REPL. First 2000 chars: {truncated_ans}"
-
-                if self.compact_enabled:
-                    with console.get_status_spinner("Memory summarization...") as status:
-                        messages_to_summarize = self.messages[interaction_start_idx:]
-                        summary = self.compactor.summarize(messages_to_summarize)
-
-                        self.messages = self.messages[:interaction_start_idx] + [
-                            {"role": "system", "content": f"Previous interaction summary: {summary}{note}"}
-                        ]
-                else:
-                    self.messages.append({
-                        "role": "system",
-                        "content": f"Interaction complete. {note}"
-                    })
-
-                return final_answer
+                    return final_answer
+        except Exception as exc:
+            trace.outcome = RunOutcome(
+                status="error",
+                ended_at=utc_now(),
+                duration_ms=(time.perf_counter() - run_started_perf) * 1000,
+                final_answer_path=final_answer_path,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                root_iterations=len(trace.root_calls),
+                repl_exec_count=len(trace.repl_execs),
+            )
+            raise
+        finally:
+            if trace.outcome is None:
+                trace.outcome = RunOutcome(
+                    status="success",
+                    ended_at=utc_now(),
+                    duration_ms=(time.perf_counter() - run_started_perf) * 1000,
+                    final_answer_path=final_answer_path,
+                    root_iterations=len(trace.root_calls),
+                    repl_exec_count=len(trace.repl_execs),
+                )
+            self.trace_writer.append(trace)
