@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import pickle
 import time
 from datetime import datetime
 from pathlib import Path
@@ -10,8 +11,10 @@ from rlm.orchestrator.memory_compaction import MemoryCompactor
 from rlm.tracing import (
     ContextWindowMetrics,
     JSONLTraceWriter,
+    MemoryCompactionCallEvent,
     ReplExecEvent,
     RootLLMCallEvent,
+    StateSnapshotEvent,
     SubLLMCallEvent,
     RunOutcome,
     UsageMetrics,
@@ -79,6 +82,47 @@ def _update_sub_totals(trace, usage: UsageMetrics, cost_usd: float | None) -> No
     trace.totals.sub_completion_tokens += usage.completion_tokens or 0
     trace.totals.sub_total_tokens += usage.total_tokens or 0
     trace.totals.total_cost_usd += cost_usd or 0.0
+
+
+def _update_compaction_totals(trace, usage: UsageMetrics, cost_usd: float | None) -> None:
+    trace.totals.compaction_prompt_tokens += usage.prompt_tokens or 0
+    trace.totals.compaction_completion_tokens += usage.completion_tokens or 0
+    trace.totals.compaction_total_tokens += usage.total_tokens or 0
+    trace.totals.total_cost_usd += cost_usd or 0.0
+
+
+def _capture_state_snapshot(trace, state_path: Path) -> None:
+    if not state_path.exists():
+        return
+    try:
+        with state_path.open("rb") as handle:
+            state = pickle.load(handle)
+    except Exception as exc:
+        logger.warning(f"Failed to read REPL state snapshot: {exc}")
+        return
+    if not isinstance(state, dict):
+        return
+
+    files = state.get("files", {})
+    buffers = state.get("buffers", [])
+    persisted_globals = state.get("globals", {})
+    loaded_file_chars = {
+        str(name): len(str(info.get("content", "")))
+        for name, info in files.items()
+        if isinstance(info, dict)
+    }
+    snapshot = StateSnapshotEvent(
+        snapshot_index=len(trace.state_snapshots) + 1,
+        recorded_at=utc_now(),
+        active_file=state.get("active_file"),
+        loaded_file_count=len(files),
+        loaded_file_chars=loaded_file_chars,
+        total_loaded_chars=sum(loaded_file_chars.values()),
+        buffer_count=len(buffers) if isinstance(buffers, list) else 0,
+        total_buffer_chars=sum(len(str(item)) for item in buffers) if isinstance(buffers, list) else 0,
+        persisted_globals_count=len(persisted_globals) if isinstance(persisted_globals, dict) else 0,
+    )
+    trace.state_snapshots.append(snapshot)
 
 
 def _parse_sub_llm_event(payload: dict, call_index: int) -> SubLLMCallEvent:
@@ -242,6 +286,7 @@ class Orchestrator:
         iteration_count = 0
         sub_llm_event_lines = 0
         sub_llm_trace_path = None
+        repl_state_path = self.workspace / "state.pkl"
 
         self.messages.append({"role": "user", "content": user_query})
         if trace is not None and self.tracing_config["capture_sub_llm"]:
@@ -309,7 +354,10 @@ class Orchestrator:
                     if self.compact_enabled:
                         with console.get_status_spinner("Memory summarization...") as status:
                             messages_to_summarize = self.messages[interaction_start_idx:]
-                            summary = self.compactor.summarize(messages_to_summarize)
+                            summary, compaction_event = self.compactor.summarize_with_event(messages_to_summarize)
+                            if trace is not None and compaction_event is not None:
+                                trace.compaction_calls.append(compaction_event)
+                                _update_compaction_totals(trace, compaction_event.usage, compaction_event.cost_usd)
 
                             self.messages = self.messages[:interaction_start_idx] + [
                                 {"role": "system", "content": f"Previous interaction summary: {summary}"}
@@ -377,6 +425,8 @@ class Orchestrator:
                                         sub_llm_trace_path,
                                         sub_llm_event_lines,
                                     )
+                                if self.tracing_config["capture_state_snapshots"]:
+                                    _capture_state_snapshot(trace, repl_state_path)
 
                             if final_path.exists():
                                 final_answer = final_path.read_text(encoding="utf-8")
@@ -415,6 +465,8 @@ class Orchestrator:
                                         sub_llm_trace_path,
                                         sub_llm_event_lines,
                                     )
+                                if self.tracing_config["capture_state_snapshots"]:
+                                    _capture_state_snapshot(trace, repl_state_path)
                     else:
                         self.messages.append({
                             "role": "tool",
@@ -429,7 +481,10 @@ class Orchestrator:
                     if self.compact_enabled:
                         with console.get_status_spinner("Memory summarization...") as status:
                             messages_to_summarize = self.messages[interaction_start_idx:]
-                            summary = self.compactor.summarize(messages_to_summarize)
+                            summary, compaction_event = self.compactor.summarize_with_event(messages_to_summarize)
+                            if trace is not None and compaction_event is not None:
+                                trace.compaction_calls.append(compaction_event)
+                                _update_compaction_totals(trace, compaction_event.usage, compaction_event.cost_usd)
 
                             self.messages = self.messages[:interaction_start_idx] + [
                                 {"role": "system", "content": f"Previous interaction summary: {summary}{note}"}

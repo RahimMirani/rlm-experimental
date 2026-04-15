@@ -113,6 +113,7 @@ class MemoryCompactionCallEvent:
     context: ContextWindowMetrics = field(default_factory=ContextWindowMetrics)
     cost_usd: float | None = None
     input_message_count: int | None = None
+    output_message_count: int | None = None
     summary_chars: int | None = None
 
 
