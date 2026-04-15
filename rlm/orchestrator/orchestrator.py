@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 import litellm
 from rlm.orchestrator.tools import docker_runner
@@ -11,6 +12,7 @@ from rlm.tracing import (
     JSONLTraceWriter,
     ReplExecEvent,
     RootLLMCallEvent,
+    SubLLMCallEvent,
     RunOutcome,
     UsageMetrics,
     create_run_trace,
@@ -27,6 +29,7 @@ def load_system_prompt() -> str:
     return "You are an RLM (Reasoning Language Model) that analyzes large files through a Python REPL."
 
 FINAL_ANSWER_FILENAME = "__rlm_final__.txt"
+SUB_LLM_TRACE_FILENAME_TEMPLATE = "sub-llm-events-{run_id}.jsonl"
 
 
 def _message_content_chars(messages: list[dict]) -> int:
@@ -69,6 +72,60 @@ def _update_root_totals(trace, usage: UsageMetrics, cost_usd: float | None) -> N
     trace.totals.root_completion_tokens += usage.completion_tokens or 0
     trace.totals.root_total_tokens += usage.total_tokens or 0
     trace.totals.total_cost_usd += cost_usd or 0.0
+
+
+def _update_sub_totals(trace, usage: UsageMetrics, cost_usd: float | None) -> None:
+    trace.totals.sub_prompt_tokens += usage.prompt_tokens or 0
+    trace.totals.sub_completion_tokens += usage.completion_tokens or 0
+    trace.totals.sub_total_tokens += usage.total_tokens or 0
+    trace.totals.total_cost_usd += cost_usd or 0.0
+
+
+def _parse_sub_llm_event(payload: dict, call_index: int) -> SubLLMCallEvent:
+    usage_payload = payload.get("usage") or {}
+    context_payload = payload.get("context") or {}
+    return SubLLMCallEvent(
+        call_index=call_index,
+        started_at=datetime.fromisoformat(payload["started_at"]),
+        ended_at=datetime.fromisoformat(payload["ended_at"]),
+        latency_ms=payload.get("latency_ms", 0.0),
+        model=payload.get("model", "unknown"),
+        usage=UsageMetrics(
+            prompt_tokens=usage_payload.get("prompt_tokens"),
+            completion_tokens=usage_payload.get("completion_tokens"),
+            total_tokens=usage_payload.get("total_tokens"),
+        ),
+        context=ContextWindowMetrics(
+            prompt_chars=context_payload.get("prompt_chars"),
+            prompt_messages=context_payload.get("prompt_messages"),
+            context_window_tokens=context_payload.get("context_window_tokens"),
+            context_window_pct=context_payload.get("context_window_pct"),
+        ),
+        cost_usd=payload.get("cost_usd"),
+        instruction_chars=payload.get("instruction_chars"),
+        chunk_chars=payload.get("chunk_chars"),
+        temperature=payload.get("temperature"),
+        error=payload.get("error"),
+    )
+
+
+def _ingest_sub_llm_events(trace, event_path: Path, consumed_lines: int) -> int:
+    if not event_path.exists():
+        return consumed_lines
+
+    lines = event_path.read_text(encoding="utf-8").splitlines()
+    for raw_line in lines[consumed_lines:]:
+        if not raw_line.strip():
+            continue
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed sub-LLM trace line")
+            continue
+        event = _parse_sub_llm_event(payload, len(trace.sub_llm_calls) + 1)
+        trace.sub_llm_calls.append(event)
+        _update_sub_totals(trace, event.usage, event.cost_usd)
+    return len(lines)
 
 REPL_TOOL = {
     "type": "function",
@@ -149,9 +206,18 @@ class Orchestrator:
                 paths.append(Path(p))
         return paths
 
-    def _get_extra_env_for_repl(self) -> dict:
+    def _get_extra_env_for_repl(self, trace=None) -> dict:
         """Build environment variables to pass to REPL container."""
         extra_env = {"RLM_MODEL": self.sub_model}
+        if (
+            trace is not None
+            and self.tracing_enabled
+            and self.tracing_config["capture_sub_llm"]
+        ):
+            extra_env["RLM_TRACE_SUB_LLM"] = "true"
+            extra_env["RLM_TRACE_SUB_LLM_PATH"] = (
+                f"/workspace/{SUB_LLM_TRACE_FILENAME_TEMPLATE.format(run_id=trace.metadata.run_id)}"
+            )
 
         for k, v in os.environ.items():
             if k.startswith(("RLM_", "OPENAI_", "ANTHROPIC_", "AZURE_", "GEMINI_")):
@@ -174,8 +240,16 @@ class Orchestrator:
         final_answer_path = None
         final_answer = None
         iteration_count = 0
+        sub_llm_event_lines = 0
+        sub_llm_trace_path = None
 
         self.messages.append({"role": "user", "content": user_query})
+        if trace is not None and self.tracing_config["capture_sub_llm"]:
+            sub_llm_trace_path = self.workspace / SUB_LLM_TRACE_FILENAME_TEMPLATE.format(
+                run_id=trace.metadata.run_id
+            )
+            if sub_llm_trace_path.exists():
+                sub_llm_trace_path.unlink()
 
         try:
             while True:
@@ -256,7 +330,7 @@ class Orchestrator:
                             console.print_tool_call(python_code)
 
                             current_mounts = self._extract_file_paths(python_code)
-                            extra_env = self._get_extra_env_for_repl()
+                            extra_env = self._get_extra_env_for_repl(trace)
 
                             with console.get_status_spinner("Executing REPL...") as status:
                                 stdout, stderr, exit_code = docker_runner.run_exec(
@@ -297,6 +371,12 @@ class Orchestrator:
                                     tool_call_id=tool_call.id,
                                 )
                                 trace.repl_execs.append(repl_event)
+                                if sub_llm_trace_path is not None:
+                                    sub_llm_event_lines = _ingest_sub_llm_events(
+                                        trace,
+                                        sub_llm_trace_path,
+                                        sub_llm_event_lines,
+                                    )
 
                             if final_path.exists():
                                 final_answer = final_path.read_text(encoding="utf-8")
@@ -329,6 +409,12 @@ class Orchestrator:
                                         tool_call_id=tool_call.id,
                                     )
                                 )
+                                if sub_llm_trace_path is not None:
+                                    sub_llm_event_lines = _ingest_sub_llm_events(
+                                        trace,
+                                        sub_llm_trace_path,
+                                        sub_llm_event_lines,
+                                    )
                     else:
                         self.messages.append({
                             "role": "tool",
@@ -370,6 +456,8 @@ class Orchestrator:
             raise
         finally:
             if trace is not None:
+                if sub_llm_trace_path is not None:
+                    _ingest_sub_llm_events(trace, sub_llm_trace_path, sub_llm_event_lines)
                 if trace.outcome is None:
                     trace.outcome = RunOutcome(
                         status="success",

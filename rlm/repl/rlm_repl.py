@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import pickle
 import re
@@ -43,6 +44,7 @@ import textwrap
 import time
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -133,11 +135,63 @@ def _load_env_vars():
         load_dotenv("/app/.env", override=True)
     load_dotenv(override=True)
 
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _extract_usage_metrics(response) -> Dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    if usage is None and hasattr(response, "model_dump"):
+        usage = response.model_dump().get("usage")
+    if usage is None:
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+
+    if hasattr(usage, "prompt_tokens"):
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+    else:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _safe_completion_cost(response) -> float | None:
+    try:
+        import litellm
+
+        cost = litellm.completion_cost(completion_response=response)
+    except Exception:
+        return None
+    return float(cost) if cost is not None else None
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    _ensure_parent_dir(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True))
+        handle.write("\n")
+
+
 def _make_llm_query():
     """Create the llm_query helper that delegates chunk analysis to a sub-LLM."""
     import os
     import sys
     _load_env_vars()
+    trace_sub_llm = os.environ.get("RLM_TRACE_SUB_LLM", "").lower() == "true"
+    trace_path_env = os.environ.get("RLM_TRACE_SUB_LLM_PATH")
+    trace_path = Path(trace_path_env) if trace_path_env else None
 
     def llm_query(
         chunk: str,
@@ -155,6 +209,8 @@ def _make_llm_query():
 
         model = model or os.environ.get("RLM_MODEL", "openai/gpt-4o-mini")
         prompt = f"{instruction}\n\n---\n\n{chunk}"
+        started_at = _utc_now_iso()
+        started_perf = time.perf_counter()
 
         try:
             response = litellm.completion(
@@ -162,9 +218,58 @@ def _make_llm_query():
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            if trace_sub_llm and trace_path is not None:
+                _append_jsonl(
+                    trace_path,
+                    {
+                        "started_at": started_at,
+                        "ended_at": _utc_now_iso(),
+                        "latency_ms": (time.perf_counter() - started_perf) * 1000,
+                        "model": model,
+                        "usage": _extract_usage_metrics(response),
+                        "context": {
+                            "prompt_chars": len(prompt),
+                            "prompt_messages": 1,
+                            "context_window_tokens": None,
+                            "context_window_pct": None,
+                        },
+                        "cost_usd": _safe_completion_cost(response),
+                        "instruction_chars": len(instruction),
+                        "chunk_chars": len(chunk),
+                        "temperature": temperature,
+                        "error": None,
+                    },
+                )
+            return content
         except Exception as e:
             error_msg = f"[llm_query error: {type(e).__name__}: {str(e)}]"
+            if trace_sub_llm and trace_path is not None:
+                _append_jsonl(
+                    trace_path,
+                    {
+                        "started_at": started_at,
+                        "ended_at": _utc_now_iso(),
+                        "latency_ms": (time.perf_counter() - started_perf) * 1000,
+                        "model": model,
+                        "usage": {
+                            "prompt_tokens": None,
+                            "completion_tokens": None,
+                            "total_tokens": None,
+                        },
+                        "context": {
+                            "prompt_chars": len(prompt),
+                            "prompt_messages": 1,
+                            "context_window_tokens": None,
+                            "context_window_pct": None,
+                        },
+                        "cost_usd": None,
+                        "instruction_chars": len(instruction),
+                        "chunk_chars": len(chunk),
+                        "temperature": temperature,
+                        "error": error_msg,
+                    },
+                )
             print(error_msg, file=sys.stderr)
             import traceback
             traceback.print_exc(file=sys.stderr)
