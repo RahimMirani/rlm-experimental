@@ -22,8 +22,27 @@ DEFAULT_FALLBACK_CONFIG = {
     },
     "memory_compaction": {
         "enabled": True
-    }
+    },
+    "tracing": {
+        "enabled": True,
+        "log_dir": "logs/traces",
+        "capture_repl_code": True,
+        "capture_state_snapshots": True,
+        "capture_sub_llm": True
+    },
+    "max_iterations": 25
 }
+
+
+def _merge_config_defaults(config: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
+    merged = config.copy()
+    for key, default_value in defaults.items():
+        if key not in merged:
+            merged[key] = default_value.copy() if isinstance(default_value, dict) else default_value
+            continue
+        if isinstance(default_value, dict) and isinstance(merged[key], dict):
+            merged[key] = _merge_config_defaults(merged[key], default_value)
+    return merged
 
 
 def validate_config(config: Dict[str, Any]) -> None:
@@ -32,7 +51,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     Raises:
         ValueError: If configuration is invalid
     """
-    required_sections = ["root_llm", "sub_llm", "memory_compaction"]
+    required_sections = ["root_llm", "sub_llm", "memory_compaction", "tracing"]
     for section in required_sections:
         if section not in config:
             raise ValueError(f"Missing required configuration section: {section}")
@@ -53,6 +72,27 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("Missing 'enabled' in memory_compaction configuration")
     if not isinstance(compact_config["enabled"], bool):
         raise ValueError("memory_compaction.enabled must be a boolean")
+
+    tracing_config = config["tracing"]
+    tracing_bool_keys = [
+        "enabled",
+        "capture_repl_code",
+        "capture_state_snapshots",
+        "capture_sub_llm",
+    ]
+    for key in tracing_bool_keys:
+        if key not in tracing_config:
+            raise ValueError(f"Missing '{key}' in tracing configuration")
+        if not isinstance(tracing_config[key], bool):
+            raise ValueError(f"tracing.{key} must be a boolean")
+
+    log_dir = tracing_config.get("log_dir")
+    if not isinstance(log_dir, str) or not log_dir.strip():
+        raise ValueError("tracing.log_dir must be a non-empty string")
+
+    max_iterations = config.get("max_iterations")
+    if not isinstance(max_iterations, int) or max_iterations <= 0:
+        raise ValueError("max_iterations must be a positive integer")
 
     logger.info("Configuration validation passed")
 
@@ -80,6 +120,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON in {config_path}: {e}")
 
+    config = _merge_config_defaults(config, DEFAULT_FALLBACK_CONFIG)
     validate_config(config)
 
     logger.info(f"Loaded configuration from {config_path}")
@@ -101,6 +142,7 @@ def apply_cli_overrides(
     config["root_llm"] = config["root_llm"].copy()
     config["sub_llm"] = config["sub_llm"].copy()
     config["memory_compaction"] = config["memory_compaction"].copy()
+    config["tracing"] = config["tracing"].copy()
 
     if model:
         if "/" not in model:

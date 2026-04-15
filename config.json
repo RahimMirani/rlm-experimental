@@ -7,5 +7,13 @@
   },
   "memory_compaction": {
     "enabled": true
-  }
+  },
+  "tracing": {
+    "enabled": true,
+    "log_dir": "logs/traces",
+    "capture_repl_code": true,
+    "capture_state_snapshots": true,
+    "capture_sub_llm": true
+  },
+  "max_iterations": 25
 }

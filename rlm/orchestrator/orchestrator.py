@@ -122,7 +122,14 @@ class Orchestrator:
         self.messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
         self.compactor = MemoryCompactor(config)
         self.compact_enabled = config["memory_compaction"]["enabled"]
-        self.trace_writer = JSONLTraceWriter()
+        self.tracing_config = config["tracing"]
+        self.tracing_enabled = self.tracing_config["enabled"]
+        self.max_iterations = config["max_iterations"]
+        self.trace_writer = (
+            JSONLTraceWriter(self.tracing_config["log_dir"])
+            if self.tracing_enabled
+            else None
+        )
 
         logger.info(
             f"Orchestrator initialized: root_model={self.root_model}, "
@@ -153,21 +160,32 @@ class Orchestrator:
         return extra_env
 
     def run(self, user_query: str):
-        trace = create_run_trace(
-            query=user_query,
-            root_model=self.root_model,
-            sub_model=self.sub_model,
+        trace = (
+            create_run_trace(
+                query=user_query,
+                root_model=self.root_model,
+                sub_model=self.sub_model,
+            )
+            if self.tracing_enabled
+            else None
         )
         run_started_perf = time.perf_counter()
         interaction_start_idx = len(self.messages)
         final_answer_path = None
         final_answer = None
+        iteration_count = 0
 
         self.messages.append({"role": "user", "content": user_query})
 
         try:
             while True:
-                call_index = len(trace.root_calls) + 1
+                iteration_count += 1
+                if iteration_count > self.max_iterations:
+                    raise RuntimeError(
+                        f"Max iterations reached ({self.max_iterations}) before producing a final answer"
+                    )
+
+                call_index = len(trace.root_calls) + 1 if trace is not None else iteration_count
                 root_started_at = utc_now()
                 root_started_perf = time.perf_counter()
                 completion_kwargs = {
@@ -183,25 +201,26 @@ class Orchestrator:
                 usage = _extract_usage_metrics(response)
                 cost_usd = _safe_completion_cost(response)
                 assistant_message = response.choices[0].message
-                root_event = RootLLMCallEvent(
-                    call_index=call_index,
-                    started_at=root_started_at,
-                    ended_at=root_ended_at,
-                    latency_ms=(time.perf_counter() - root_started_perf) * 1000,
-                    model=self.root_model,
-                    usage=usage,
-                    context=ContextWindowMetrics(
-                        prompt_chars=_message_content_chars(self.messages),
-                        prompt_messages=len(self.messages),
-                    ),
-                    cost_usd=cost_usd,
-                    message_count=len(self.messages),
-                    tool_call_count=len(assistant_message.tool_calls or []),
-                    assistant_content_chars=len(assistant_message.content or ""),
-                    finish_reason=getattr(response.choices[0], "finish_reason", None),
-                )
-                trace.root_calls.append(root_event)
-                _update_root_totals(trace, usage, cost_usd)
+                if trace is not None:
+                    root_event = RootLLMCallEvent(
+                        call_index=call_index,
+                        started_at=root_started_at,
+                        ended_at=root_ended_at,
+                        latency_ms=(time.perf_counter() - root_started_perf) * 1000,
+                        model=self.root_model,
+                        usage=usage,
+                        context=ContextWindowMetrics(
+                            prompt_chars=_message_content_chars(self.messages),
+                            prompt_messages=len(self.messages),
+                        ),
+                        cost_usd=cost_usd,
+                        message_count=len(self.messages),
+                        tool_call_count=len(assistant_message.tool_calls or []),
+                        assistant_content_chars=len(assistant_message.content or ""),
+                        finish_reason=getattr(response.choices[0], "finish_reason", None),
+                    )
+                    trace.root_calls.append(root_event)
+                    _update_root_totals(trace, usage, cost_usd)
 
                 msg_dict = assistant_message.model_dump()
                 if msg_dict.get("content") is None:
@@ -263,20 +282,21 @@ class Orchestrator:
                             })
 
                             final_path = self.workspace / FINAL_ANSWER_FILENAME
-                            repl_event = ReplExecEvent(
-                                exec_index=len(trace.repl_execs) + 1,
-                                started_at=repl_started_at,
-                                ended_at=utc_now(),
-                                latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
-                                python_code_chars=len(python_code),
-                                mounted_paths=[str(path) for path in current_mounts],
-                                exit_code=exit_code,
-                                stdout_chars=len(stdout),
-                                stderr_chars=len(stderr),
-                                final_answer_emitted=final_path.exists(),
-                                tool_call_id=tool_call.id,
-                            )
-                            trace.repl_execs.append(repl_event)
+                            if trace is not None:
+                                repl_event = ReplExecEvent(
+                                    exec_index=len(trace.repl_execs) + 1,
+                                    started_at=repl_started_at,
+                                    ended_at=utc_now(),
+                                    latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
+                                    python_code_chars=len(python_code),
+                                    mounted_paths=[str(path) for path in current_mounts],
+                                    exit_code=exit_code,
+                                    stdout_chars=len(stdout),
+                                    stderr_chars=len(stderr),
+                                    final_answer_emitted=final_path.exists(),
+                                    tool_call_id=tool_call.id,
+                                )
+                                trace.repl_execs.append(repl_event)
 
                             if final_path.exists():
                                 final_answer = final_path.read_text(encoding="utf-8")
@@ -293,21 +313,22 @@ class Orchestrator:
                                 "tool_call_id": tool_call.id,
                                 "content": error_msg
                             })
-                            trace.repl_execs.append(
-                                ReplExecEvent(
-                                    exec_index=len(trace.repl_execs) + 1,
-                                    started_at=repl_started_at,
-                                    ended_at=utc_now(),
-                                    latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
-                                    python_code_chars=len(python_code),
-                                    mounted_paths=[str(path) for path in current_mounts],
-                                    exit_code=None,
-                                    stdout_chars=0,
-                                    stderr_chars=len(error_msg),
-                                    final_answer_emitted=False,
-                                    tool_call_id=tool_call.id,
+                            if trace is not None:
+                                trace.repl_execs.append(
+                                    ReplExecEvent(
+                                        exec_index=len(trace.repl_execs) + 1,
+                                        started_at=repl_started_at,
+                                        ended_at=utc_now(),
+                                        latency_ms=(time.perf_counter() - repl_started_perf) * 1000,
+                                        python_code_chars=len(python_code),
+                                        mounted_paths=[str(path) for path in current_mounts],
+                                        exit_code=None,
+                                        stdout_chars=0,
+                                        stderr_chars=len(error_msg),
+                                        final_answer_emitted=False,
+                                        tool_call_id=tool_call.id,
+                                    )
                                 )
-                            )
                     else:
                         self.messages.append({
                             "role": "tool",
@@ -335,25 +356,27 @@ class Orchestrator:
 
                     return final_answer
         except Exception as exc:
-            trace.outcome = RunOutcome(
-                status="error",
-                ended_at=utc_now(),
-                duration_ms=(time.perf_counter() - run_started_perf) * 1000,
-                final_answer_path=final_answer_path,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                root_iterations=len(trace.root_calls),
-                repl_exec_count=len(trace.repl_execs),
-            )
-            raise
-        finally:
-            if trace.outcome is None:
+            if trace is not None:
                 trace.outcome = RunOutcome(
-                    status="success",
+                    status="error",
                     ended_at=utc_now(),
                     duration_ms=(time.perf_counter() - run_started_perf) * 1000,
                     final_answer_path=final_answer_path,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
                     root_iterations=len(trace.root_calls),
                     repl_exec_count=len(trace.repl_execs),
                 )
-            self.trace_writer.append(trace)
+            raise
+        finally:
+            if trace is not None:
+                if trace.outcome is None:
+                    trace.outcome = RunOutcome(
+                        status="success",
+                        ended_at=utc_now(),
+                        duration_ms=(time.perf_counter() - run_started_perf) * 1000,
+                        final_answer_path=final_answer_path,
+                        root_iterations=len(trace.root_calls),
+                        repl_exec_count=len(trace.repl_execs),
+                    )
+                self.trace_writer.append(trace)
